@@ -3,6 +3,9 @@
 #include <BLEServer.h>
 #include <BLE2902.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
 #include "aes.h"
 #include "keys.h"
 #include "board_config.h"
@@ -19,7 +22,10 @@
 // ---------------------------------------------------------------------------
 struct AlarmState {
   bool locked = true;
-  bool lastNotified = false;
+  bool powerOn = false;       // GPIO POWER_PIN (encender)
+  bool starterActive = false; // boton "Arrancar" mantenido
+  bool button1Active = false; // boton "Boton 1" mantenido
+  bool button2Active = false; // boton "Boton 2" mantenido
 };
 
 AlarmState alarmState;
@@ -35,14 +41,28 @@ volatile bool clientConnected = false;
 volatile bool notificationsEnabled = false;
 volatile bool restartAdvertising = false;
 
-enum PendingAction : uint8_t {
-  ACTION_NONE = 0,
-  ACTION_LOCK,
-  ACTION_UNLOCK,
-  ACTION_TOGGLE
+// Comandos que llegan desde la app. Se encolan en el callback BLE y se
+// procesan en el loop para no bloquear el stack de Bluetooth.
+enum Command : uint8_t {
+  CMD_NONE = 0,
+  CMD_TOGGLE_LOCK,     // "1"
+  CMD_TOGGLE_POWER,    // "2"
+  CMD_STARTER_DOWN,    // "3"
+  CMD_STARTER_UP,      // "3u"
+  CMD_BUTTON1_DOWN,    // "4"
+  CMD_BUTTON1_UP,      // "4u"
+  CMD_BUTTON2_DOWN,    // "5"
+  CMD_BUTTON2_UP       // "5u"
 };
 
-volatile PendingAction pendingAction = ACTION_NONE;
+QueueHandle_t commandQueue = nullptr;
+
+unsigned long lastStarterRefreshMs = 0;
+unsigned long lastButton1RefreshMs = 0;
+unsigned long lastButton2RefreshMs = 0;
+
+// Ultimo estado enviado al telefono. Se envia de nuevo cuando cambia.
+char lastStatusSent[32] = "";
 
 unsigned long lastBlinkMs = 0;
 bool blinkState = false;
@@ -61,21 +81,76 @@ void setRelayUnlocked(bool unlocked) {
   digitalWrite(RELEPIN, unlocked ? HIGH : LOW);
 }
 
-void playTone() {
-  noTone(BUZZER_PIN);
-  tone(BUZZER_PIN, 1000);
-  delay(200);
-  noTone(BUZZER_PIN);
-  delay(5);
-  tone(BUZZER_PIN, 500);
-  delay(200);
-  noTone(BUZZER_PIN);
+// Aplica el estado de las salidas nuevas. "Arrancar" y "Boton 1" pueden
+// compartir GPIO 15: en ese caso la linea se activa con un OR logico.
+void applyAuxOutputs() {
+  digitalWrite(POWER_PIN, (alarmState.powerOn && !alarmState.locked) ? HIGH : LOW);
+
+#if BUTTON2_PIN == BUTTON1_PIN
+  bool starterLine = alarmState.button2Active || alarmState.button1Active;
+  digitalWrite(BUTTON1_PIN, starterLine ? HIGH : LOW);
+#else
+  digitalWrite(BUTTON1_PIN, alarmState.button1Active ? HIGH : LOW);
+  digitalWrite(BUTTON2_PIN, alarmState.button2Active ? HIGH : LOW);
+#endif
+digitalWrite(STARTER_PIN, (alarmState.starterActive && alarmState.powerOn && !alarmState.locked) ? LOW : HIGH);
 }
 
-void lockAlarm() {
+// Apaga todas las salidas momentaneas (arranque y botones 1/2).
+void releaseMomentaryOutputs() {
+  alarmState.starterActive = false;
+  alarmState.button1Active = false;
+  alarmState.button2Active = false;
+  applyAuxOutputs();
+}
+
+// Encola un comando para que lo procese el loop (nunca bloquea el stack BLE).
+void enqueueCommand(Command command) {
+  if (commandQueue == nullptr) {
+    return;
+  }
+  if (xQueueSend(commandQueue, &command, 0) != pdTRUE) {
+    Serial.println("[BLE] Cola de comandos llena, comando descartado");
+  }
+}
+
+// Descarta comandos pendientes. Se usa al conectar/desconectar para que un
+// comando viejo no reactive una salida despues de la liberacion de seguridad.
+void clearCommandQueue() {
+  if (commandQueue != nullptr) {
+    xQueueReset(commandQueue);
+  }
+}
+
+// void playTone() {
+//   noTone(BUZZER_PIN);
+//   tone(BUZZER_PIN, 1000);
+//   delay(200);
+//   noTone(BUZZER_PIN);
+//   delay(5);
+//   tone(BUZZER_PIN, 500);
+//   delay(200);
+//   noTone(BUZZER_PIN);
+// }
+void playTone() {
+  digitalWrite(BUZZER_PIN, 0);
+  digitalWrite(BUZZER_PIN, 1);
+  delay(200);
+  digitalWrite(BUZZER_PIN, 0);
+  delay(5);
+  digitalWrite(BUZZER_PIN, 1);
+  delay(200);
+  digitalWrite(BUZZER_PIN, 0);
+}
+
+void lockAlarmState() {
   alarmState.locked = true;
   setLed(true);
   setRelayUnlocked(false);
+}
+
+void lockAlarm() {
+  lockAlarmState();
   playTone();
   Serial.println("[ALARMA] Bloqueada");
 }
@@ -88,6 +163,131 @@ void unlockAlarm() {
   Serial.println("[ALARMA] Desbloqueada");
 }
 
+void togglePower() {
+  alarmState.powerOn = !alarmState.powerOn;
+  applyAuxOutputs();
+  Serial.printf("[SALIDA] Encendido: %s\n", alarmState.powerOn ? "ON" : "OFF");
+}
+
+void powerOff() {
+  alarmState.powerOn = false;
+  applyAuxOutputs();
+  Serial.printf("[SALIDA] Encendido: %s\n", alarmState.powerOn ? "ON" : "OFF");
+}
+
+void handleCommand(Command command) {
+  unsigned long now = millis();
+
+  switch (command) {
+    case CMD_TOGGLE_LOCK:
+      if (alarmState.locked) {
+        unlockAlarm();
+      } else {
+        lockAlarm();
+      }
+      applyAuxOutputs();
+      break;
+
+    case CMD_TOGGLE_POWER:
+      togglePower();
+      break;
+
+    case CMD_STARTER_DOWN:
+      alarmState.starterActive = true;
+      lastStarterRefreshMs = now;
+      applyAuxOutputs();
+      break;
+
+    case CMD_STARTER_UP:
+      alarmState.starterActive = false;
+      applyAuxOutputs();
+      break;
+
+    case CMD_BUTTON1_DOWN:
+      alarmState.button1Active = true;
+      lastButton1RefreshMs = now;
+      applyAuxOutputs();
+      break;
+
+    case CMD_BUTTON1_UP:
+      alarmState.button1Active = false;
+      applyAuxOutputs();
+      break;
+
+    case CMD_BUTTON2_DOWN:
+      alarmState.button2Active = true;
+      lastButton2RefreshMs = now;
+      applyAuxOutputs();
+      break;
+
+    case CMD_BUTTON2_UP:
+      alarmState.button2Active = false;
+      applyAuxOutputs();
+      break;
+
+    default:
+      break;
+  }
+}
+
+// Si la app deja de reenviar el comando de "mantener", apagamos la salida.
+// Esto cubre cierres de app, perdida de paquetes o desconexiones.
+void checkMomentaryTimeouts() {
+  unsigned long now = millis();
+  bool changed = false;
+
+  if (alarmState.starterActive && (now - lastStarterRefreshMs > HOLD_TIMEOUT_MS)) {
+    alarmState.starterActive = false;
+    changed = true;
+    Serial.println("[SALIDA] Arranque liberado por timeout");
+  }
+
+  if (alarmState.button1Active && (now - lastButton1RefreshMs > HOLD_TIMEOUT_MS)) {
+    alarmState.button1Active = false;
+    changed = true;
+    Serial.println("[SALIDA] Boton 1 liberado por timeout");
+  }
+
+  if (alarmState.button2Active && (now - lastButton2RefreshMs > HOLD_TIMEOUT_MS)) {
+    alarmState.button2Active = false;
+    changed = true;
+    Serial.println("[SALIDA] Boton 2 liberado por timeout");
+  }
+
+  if (changed) {
+    applyAuxOutputs();
+  }
+}
+
+// Traduce el texto descifrado a un comando interno.
+//   "1"  toggle bloqueo
+//   "2"  toggle encendido (GPIO 14)
+//   "3"  arranque abajo (GPIO 15)   / "3u" arranque arriba
+//   "4"  boton 1 abajo (GPIO 15)    / "4u" boton 1 arriba
+//   "5"  boton 2 abajo (GPIO 12)    / "5u" boton 2 arriba
+bool parseCommand(const char *text, Command *command) {
+  if (strcmp(text, "1") == 0) {
+    *command = CMD_TOGGLE_LOCK;
+  } else if (strcmp(text, "2") == 0) {
+    *command = CMD_TOGGLE_POWER;
+  } else if (strcmp(text, "3") == 0) {
+    *command = CMD_STARTER_DOWN;
+  } else if (strcmp(text, "3u") == 0 || strcmp(text, "3U") == 0) {
+    *command = CMD_STARTER_UP;
+  } else if (strcmp(text, "4") == 0) {
+    *command = CMD_BUTTON1_DOWN;
+  } else if (strcmp(text, "4u") == 0 || strcmp(text, "4U") == 0) {
+    *command = CMD_BUTTON1_UP;
+  } else if (strcmp(text, "5") == 0) {
+    *command = CMD_BUTTON2_DOWN;
+  } else if (strcmp(text, "5u") == 0 || strcmp(text, "5U") == 0) {
+    *command = CMD_BUTTON2_UP;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Callbacks BLE
 // ---------------------------------------------------------------------------
@@ -97,8 +297,11 @@ class ServerCallbacks : public BLEServerCallbacks {
 
     // Al reconectar, forzamos que se envie el estado actual en cuanto el
     // telefono habilite las notificaciones.
-    alarmState.lastNotified = !alarmState.locked;
+    lastStatusSent[0] = '\0';
     notificationsEnabled = false;
+
+    // Comandos de la sesion anterior no deben ejecutarse en esta.
+    clearCommandQueue();
 
     Serial.println("[BLE] Cliente conectado");
   }
@@ -107,10 +310,16 @@ class ServerCallbacks : public BLEServerCallbacks {
     clientConnected = false;
     notificationsEnabled = false;
     restartAdvertising = true;
+    lastStatusSent[0] = '\0';
 
-    // Bloqueamos al perder la conexion, pero sin bloquear el stack BLE.
-    pendingAction = ACTION_LOCK;
-
+    // Seguridad: si se cae la conexion con un boton momentaneo presionado,
+    // las salidas deben apagarse de inmediato. Se bloquea sin tone()/delay()
+    // para no bloquear el callback del stack BLE.
+    clearCommandQueue();
+    releaseMomentaryOutputs();
+    powerOff();
+    lockAlarmState();
+    
     Serial.println("[BLE] Cliente desconectado");
   }
 };
@@ -138,8 +347,9 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 
     Serial.printf("[BLE] Comando: '%s'\n", plaintext);
 
-    if (strcmp(plaintext, "1") == 0) {
-      pendingAction = ACTION_TOGGLE;
+    Command command = CMD_NONE;
+    if (parseCommand(plaintext, &command)) {
+      enqueueCommand(command);
     } else {
       Serial.println("[BLE] Comando desconocido");
     }
@@ -157,7 +367,7 @@ class StatusCccdCallbacks : public BLEDescriptorCallbacks {
 
     if (enabled) {
       // Fuerza el envio del estado actual en el proximo loop.
-      alarmState.lastNotified = !alarmState.locked;
+      lastStatusSent[0] = '\0';
       Serial.println("[BLE] Notificaciones activadas");
     } else {
       Serial.println("[BLE] Notificaciones desactivadas");
@@ -176,7 +386,7 @@ class StatusCallbacks : public BLECharacteristicCallbacks {
     notificationsEnabled = enabled;
 
     if (enabled) {
-      alarmState.lastNotified = !alarmState.locked;
+      lastStatusSent[0] = '\0';
       Serial.println("[BLE] Notificaciones activadas");
     } else {
       Serial.println("[BLE] Notificaciones desactivadas");
@@ -187,19 +397,33 @@ class StatusCallbacks : public BLECharacteristicCallbacks {
 
 // ---------------------------------------------------------------------------
 // Notificacion de estado
+//
+// Formato enviado (cifrado con AES-CBC):
+//   conectado,bloqueado,encendido,arranque,boton1,boton2
+// Ejemplo: "1,1,0,0,0,0"
 // ---------------------------------------------------------------------------
+void buildStatusMessage(char *message, size_t size) {
+  snprintf(message, size,
+           "%d,%d,%d,%d,%d,%d",
+           clientConnected ? 1 : 0,
+           alarmState.locked ? 1 : 0,
+           alarmState.powerOn ? 1 : 0,
+           alarmState.starterActive ? 1 : 0,
+           alarmState.button1Active ? 1 : 0,
+           alarmState.button2Active ? 1 : 0);
+}
+
 void notifyStatusIfNeeded() {
   if (!clientConnected || !notificationsEnabled) {
     return;
   }
-  if (alarmState.locked == alarmState.lastNotified) {
+
+  char message[32];
+  buildStatusMessage(message, sizeof(message));
+
+  if (strcmp(message, lastStatusSent) == 0) {
     return;
   }
-
-  char message[8];
-  snprintf(message, sizeof(message), "%d,%d",
-           alarmState.locked ? 1 : 0,
-           alarmState.lastNotified ? 1 : 0);
 
   uint8_t encrypted[AES_MAX_PACKET];
   size_t encryptedLen = aesEncryptText(message, encrypted, sizeof(encrypted));
@@ -210,7 +434,9 @@ void notifyStatusIfNeeded() {
 
   statusCharacteristic->setValue(encrypted, encryptedLen);
   statusCharacteristic->notify();
-  alarmState.lastNotified = alarmState.locked;
+
+  strncpy(lastStatusSent, message, sizeof(lastStatusSent) - 1);
+  lastStatusSent[sizeof(lastStatusSent) - 1] = '\0';
 
   Serial.printf("[BLE] Estado notificado: %s\n", message);
 }
@@ -222,18 +448,33 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  commandQueue = xQueueCreate(16, sizeof(Command));
+  if (commandQueue == nullptr) {
+    Serial.println("[BLE] ERROR: no se pudo crear la cola de comandos");
+  }
+
   pinMode(LEDPIN, OUTPUT);
   pinMode(RELEPIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
 
+  pinMode(POWER_PIN, OUTPUT);
+  pinMode(STARTER_PIN, OUTPUT);
+#if BUTTON1_PIN != STARTER_PIN
+  pinMode(BUTTON1_PIN, OUTPUT);
+#endif
+  pinMode(BUTTON2_PIN, OUTPUT);
+
   setLed(true);
   setRelayUnlocked(false);
   digitalWrite(BUZZER_PIN, LOW);
+  applyAuxOutputs();
 
   Serial.println();
   Serial.println("==========================================");
   Serial.printf(" Alarma Moto BLE - placa: %s\n", BOARD_NAME);
   Serial.printf(" LED=%d  RELE=%d  BUZZER=%d\n", LEDPIN, RELEPIN, BUZZER_PIN);
+  Serial.printf(" POWER=%d  STARTER=%d  BUTTON1=%d  BUTTON2=%d\n",
+                POWER_PIN, STARTER_PIN, BUTTON1_PIN, BUTTON2_PIN);
   Serial.println("==========================================");
 
   BLEDevice::init("AlarmaMoto");
@@ -294,30 +535,25 @@ void setup() {
 // Loop
 // ---------------------------------------------------------------------------
 void loop() {
-  // 1) Acciones pedidas desde callbacks BLE (nunca se bloquea el stack BLE).
-  PendingAction action = pendingAction;
-  if (action != ACTION_NONE) {
-    pendingAction = ACTION_NONE;
-
-    if (action == ACTION_TOGGLE) {
-      action = alarmState.locked ? ACTION_UNLOCK : ACTION_LOCK;
-    }
-
-    if (action == ACTION_LOCK) {
-      lockAlarm();
-    } else if (action == ACTION_UNLOCK) {
-      unlockAlarm();
+  // 1) Procesar todos los comandos encolados por el callback BLE.
+  if (commandQueue != nullptr) {
+    Command command;
+    while (xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
+      handleCommand(command);
     }
   }
 
-  // 2) Reiniciar advertising tras una desconexion.
+  // 2) Red de seguridad: liberar botones momentaneos sin refresco.
+  checkMomentaryTimeouts();
+
+  // 3) Reiniciar advertising tras una desconexion.
   if (restartAdvertising) {
     restartAdvertising = false;
     BLEDevice::startAdvertising();
     Serial.println("[BLE] Advertising reiniciado");
   }
 
-  // 3) LED: fijo conectado, parpadeo no bloqueante desconectado.
+  // 4) LED: fijo conectado, parpadeo no bloqueante desconectado.
   if (clientConnected) {
     setLed(alarmState.locked);
   } else {
@@ -329,7 +565,7 @@ void loop() {
     }
   }
 
-  // 4) Avisar cambios de estado al telefono.
+  // 5) Avisar cambios de estado al telefono.
   notifyStatusIfNeeded();
 
   delay(10);
